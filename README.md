@@ -1,6 +1,6 @@
-# EJ_Stitcher — Dual UVC Stitching Driver
+# UVC_Stitch
 
-EJ_Stitcher is a Linux kernel driver that combines the video streams from two
+UVC_Stitch is a Linux kernel driver that combines the video streams from two
 USB cameras into a single virtual camera device. The two camera feeds are
 stitched top-to-bottom and exposed as one `/dev/videoN` capture device,
 which can be used directly in OBS Studio, ffmpeg, or any other V4L2-compatible
@@ -151,15 +151,6 @@ $ v4l2-ctl -d /dev/videoN --list-formats-ext
 
 Replace `/dev/videoN` with the actual device path shown by `--list-devices`.
 
-## Capture Video
-
-Save the stitched output to a file:
-
-```bash
-$ ffmpeg -f v4l2 -input_format nv12 -video_size 3840x2160 \
-         -i /dev/videoN output.mkv
-```
-
 ## Preview
 
 Preview the live stitched stream:
@@ -221,8 +212,7 @@ stream returns the driver to idle — it does not need to be reloaded.
 
 - The target camera model (USB Vendor ID / Product ID) is fixed at compile
   time and cannot be changed without rebuilding the driver.
-- Only the NV12 pixel format is supported. MJPEG or other formats are not
-  currently available.
+- Only the NV12 pixel format is supported. 
 
 # License
 

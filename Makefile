@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Makefile for the V4L2 Proxy-Mixer driver (proxy_mixer.ko)
+# Makefile for the UVC Stitch driver (uvc_stitch.ko)
 #
 # ── Quick reference ─────────────────────────────────────────────────────────
 #   make                 Build the module
@@ -9,6 +9,8 @@
 #   make load            modprobe the module
 #   make unload          rmmod the module
 #   make reload          rmmod + modprobe
+#   make autoload        Load the module automatically at boot
+#   make noautoload      Disable automatic loading at boot
 #   make clang-format    Format all .c / .h files with kernel style
 #   make clean           Remove build artefacts
 # ────────────────────────────────────────────────────────────────────────────
@@ -18,7 +20,7 @@ MODULE_NAME := uvc_stitch
 # --- Object list ------------------------------------------------------------
 $(MODULE_NAME)-y := ejcm3_stitcher.o
 
-obj-$(CONFIG_VIDEO_PROXY_MIXER) += $(MODULE_NAME).o
+obj-$(CONFIG_UVC_STITCH) += $(MODULE_NAME).o
 
 # --- Out-of-tree build -------------------------------------------------------
 ifneq ($(KERNELRELEASE),)
@@ -28,19 +30,19 @@ else
 KDIR  ?= /lib/modules/$(shell uname -r)/build
 PWD   := $(shell pwd)
 
-EXTRA_CFLAGS := -DCONFIG_VIDEO_PROXY_MIXER=m
+EXTRA_CFLAGS := -DCONFIG_UVC_STITCH=m
 
-.PHONY: all modules modules_install install uninstall load unload reload clean help
+.PHONY: all modules modules_install install uninstall load unload reload autoload noautoload clean help
 
 all: modules
 
 modules:
-	$(MAKE) -C $(KDIR) M=$(PWD) CONFIG_VIDEO_PROXY_MIXER=m modules
+	$(MAKE) -C $(KDIR) M=$(PWD) CONFIG_UVC_STITCH=m modules
 
 # --- Install / modprobe support ----------------------------------------------
 
 modules_install:
-	$(MAKE) -C $(KDIR) M=$(PWD) CONFIG_VIDEO_PROXY_MIXER=m modules_install
+	$(MAKE) -C $(KDIR) M=$(PWD) CONFIG_UVC_STITCH=m modules_install
 	depmod -a
 
 install: modules modules_install
@@ -74,6 +76,18 @@ unload:
 	fi
 
 reload: unload load
+
+# --- Auto-load at boot (systemd-modules-load) -------------------------------
+
+AUTOLOAD_CONF := /etc/modules-load.d/$(MODULE_NAME).conf
+
+autoload:
+	@echo "$(MODULE_NAME)" > $(AUTOLOAD_CONF)
+	@echo "$(MODULE_NAME) will be loaded automatically at boot ($(AUTOLOAD_CONF))"
+
+noautoload:
+	@rm -f $(AUTOLOAD_CONF)
+	@echo "Automatic loading of $(MODULE_NAME) at boot disabled"
 
 # --- clang-format (kernel coding style) --------------------------------------
 
@@ -113,6 +127,8 @@ help:
 	@echo "  load                 - modprobe $(MODULE_NAME)"
 	@echo "  unload               - rmmod $(MODULE_NAME)"
 	@echo "  reload               - rmmod + modprobe"
+	@echo "  autoload             - load $(MODULE_NAME) automatically at boot"
+	@echo "  noautoload           - disable automatic loading at boot"
 	@echo "  clang-format         - format sources with kernel .clang-format"
 	@echo "  clang-format-check   - dry-run check (CI friendly)"
 	@echo "  clean                - remove build artefacts + .clang-format"

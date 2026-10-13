@@ -2551,7 +2551,7 @@ static void init_vdev(struct uvc_stitcher *stitcher)
 	vdev->release = video_device_release;
 	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
 			    V4L2_CAP_READWRITE;
-	strscpy(vdev->name, "Dual Video Mixer", sizeof(vdev->name));
+	strscpy(vdev->name, "UVC Stitch", sizeof(vdev->name));
 	vdev->vfl_type = VFL_TYPE_VIDEO;
 	vdev->vfl_dir = VFL_DIR_RX;
 

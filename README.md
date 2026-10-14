@@ -9,9 +9,10 @@ the two halves into one frame and exposes one `/dev/videoN` capture device for
 OBS Studio, ffmpeg, and other V4L2-compatible applications. No separate
 user-space stitching process is needed.
 
-The virtual camera is available as soon as the driver is loaded. The UVC devices
-from the EJ535's P and S ports are detected when connected. Streaming starts
-when both are ready and an application requests video.
+The virtual camera appears only while both the P and S ports of the EJ535 are
+connected, and disappears as soon as either one is disconnected. Its format
+list is taken from the S port: same width, twice the height. Streaming starts
+when an application requests video.
 
 # Hardware Requirements
 
@@ -24,8 +25,8 @@ when both are ready and an application requests video.
 | Host Interface    | PCIe Gen 3 ×2 or above; at least 10 Gbps of bandwidth is required for stable 4K@60fps |
 
 The driver only recognizes the EJ535 P/S pair with USB VID `1E4E` and PIDs
-`7301` (P) and `7302` (S). Both connections are required. For stable 4K60,
-select NV12 explicitly in the capture application.
+`7301` (P) and `7302` (S). Both connections are required. NV12 is the default
+format and is the one to use for stable 4K60.
 
 For best performance, we recommend a CPU equivalent to Intel 12th Gen Core i7
 or AMD Ryzen 7 5000 series and above. Older CPUs (e.g. Intel 7th Gen Core i5
@@ -151,8 +152,10 @@ Once installed, load the driver with:
 $ sudo modprobe uvc_stitch
 ```
 
-The virtual camera device (`/dev/videoN`) is created immediately. Connect both
-EJ535 USB ports, P and S, to the host to make both inputs available.
+Connect both EJ535 USB ports, P and S, to the host. The virtual camera device
+(`/dev/videoN`) is created once both are connected and removed when either is
+disconnected. After a reconnect the device may get a different number, so
+applications have to select it again.
 
 To unload the driver:
 
@@ -228,20 +231,23 @@ $ ffplay -f v4l2 -input_format nv12 -video_size 3840x2160 -i /dev/videoN
 Alternatively, add a Video Capture Device (V4L2) source in OBS Studio and select
 the NV12 video format for 4K60.
 
-# Default Parameters
+# Formats and Defaults
 
-The driver uses the following defaults. These can be changed before starting
-the stream via `VIDIOC_S_FMT` (resolution/format) and `VIDIOC_S_PARM` (framerate).
+The format list is built from the S port when the virtual camera is created.
+Every S-port format the driver can stitch (NV12, YUYV, UYVY, BGR3) is listed
+with the same width and twice the height; frame rates are the S port's. For
+example, an S-port `NV12 3840x1080 @ 60 fps` becomes `NV12 3840x2160 @ 60 fps`.
+The P port is set to the same format when streaming starts.
 
-| Parameter    | Default | Description                              |
-|--------------|---------|------------------------------------------|
-| `out_width`  | 3840    | Output frame width (pixels)              |
-| `out_height` | 2160    | Output frame height (pixels)             |
-| `out_pixfmt` | YUYV    | Initial format; select NV12 for 4K60    |
-| `src_width`  | 3840    | Width requested from each P/S UVC device |
-| `src_height` | 1080    | Height requested from each P/S UVC device |
-| `fps_num`    | 1       | Frame interval numerator                 |
-| `fps_den`    | 60      | Frame interval denominator (60 fps)      |
+| Setting    | Default                                         |
+|------------|-------------------------------------------------|
+| Format     | NV12                                            |
+| Resolution | Largest NV12 size (e.g. 3840×2160)              |
+| Frame rate | First frame interval of that size (e.g. 60 fps) |
+
+These can be changed before starting the stream via `VIDIOC_S_FMT`
+(resolution/format) and `VIDIOC_S_PARM` (framerate). Requests are snapped to
+the closest entry in the list.
 
 ---
 
@@ -250,28 +256,27 @@ the stream via `VIDIOC_S_FMT` (resolution/format) and `VIDIOC_S_PARM` (framerate
 The driver moves through the following states from load to streaming:
 
 ```
-IDLE  ──modprobe──►  video node created
+WAITING  ──modprobe──►  no video node
   │
   │  EJ535 P and S ports enumerate as UVC devices (fixed VID/PID match)
   │  src_ready_count: 0 → 1 → 2
   │
   ▼
-IDLE (slots filled)
+READY  ──►  format list copied from S, video node registered
   │
   │  VIDIOC_STREAMON
-  │    src_ready_count < 2  ──► return -ENODEV
-  │    src_ready_count == 2
-  │      UVC S_FMT / REQBUFS / QBUF / STREAMON
-  │      kthread_run()
+  │    UVC S_FMT / REQBUFS(DMABUF) / QBUF / STREAMON
+  │    kthread_run()
   ▼
 STREAMING
   │
-  ├── VIDIOC_STREAMOFF ──► stitcher_uvc_stop() → IDLE (slots kept)
-  ├── UVC unplug       ──► stitcher_uvc_stop() → IDLE (slot cleared)
-  └── rmmod            ──► stitcher_uvc_stop() → unregister → gone
+  ├── VIDIOC_STREAMOFF ──► engine stopped → READY
+  ├── P or S unplug    ──► engine stopped, video node removed → WAITING
+  └── rmmod            ──► engine stopped, video node removed → gone
 ```
 
-**In short:** loading the driver creates the virtual camera immediately.
-Streaming only starts once both EJ535 USB connections are ready and an
-application requests the stream. Disconnecting either port or stopping the
-stream returns the driver to idle — it does not need to be reloaded.
+**In short:** the virtual camera exists only while both EJ535 USB connections
+are present. Streaming starts when an application requests it. Disconnecting
+either port removes the virtual camera; an application that still has it open
+gets an error and has to open the new device after reconnecting. The driver
+does not need to be reloaded.

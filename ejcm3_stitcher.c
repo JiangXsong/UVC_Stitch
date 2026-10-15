@@ -5,6 +5,9 @@
 #include <linux/completion.h>
 #include <linux/bitops.h>
 #include <linux/delay.h>
+#include <linux/poll.h>
+#include <linux/wait.h>
+#include <linux/sched.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
@@ -60,6 +63,15 @@ static inline unsigned int vb2_get_num_buffers(struct vb2_queue *q)
 #define STITCHER_SYNC_DRAIN_FRAMES 4
 #define STITCHER_SYNC_MAX_RETRIES 3
 #define STITCHER_SEQ_MISMATCH_THRESHOLD 2
+
+/* Restarting a source that stopped (see the kthread section) */
+#define STITCHER_ERR_BURST 2		/* corrupt frames in a row */
+#define STITCHER_SRC_TIMEOUT_MS 250	/* minimum silence before a restart */
+#define STITCHER_SRC_TIMEOUT_FRAMES 8	/* ... or this many frame periods */
+#define STITCHER_RESTART_FAST 3		/* immediate restarts before backing off */
+#define STITCHER_RESTART_BACKOFF_MS 100
+#define STITCHER_RESTART_BACKOFF_MAX_MS 1000
+#define STITCHER_WATCH_HEADS 4		/* wait queues a source's poll() may use */
 
 /* Limits for the format list copied from the S-side source */
 #define STITCHER_MAX_FRMSIZES 16
@@ -172,6 +184,15 @@ struct stitcher_video_buffer {
 	struct list_head queue;
 };
 
+/* A buffer dequeued from a source */
+struct stitcher_dq {
+	unsigned int index;
+	u32 sequence;
+	u32 flags;
+	u32 bytesused;
+	ktime_t ts;
+};
+
 struct stitcher_disc_work {
 	struct work_struct work;
 	struct uvc_stitcher *stitcher;
@@ -246,9 +267,10 @@ struct stitcher_out {
  *   UVC vdev lock   taken inside UVC_CALL_OP.
  *   out->q.irqlock  spinlock for the queued output buffer list.
  *
- * The stitcher kthread only takes src_stream_lock, the UVC vdev locks and
- * irqlock, so the stop path may wait in kthread_stop() while holding the
- * mutexes above it.
+ * The stitcher kthread only takes src_stream_lock, the UVC vdev locks
+ * (also through the sources' poll()) and irqlock, so the stop path may
+ * wait in kthread_stop() while holding the mutexes above it.  The kthread
+ * sleeps holding no lock; its wait queue callbacks only wake it up.
  *
  * src[] may be read without disc_lock while the engine runs: a slot is
  * only cleared after the node using it has been marked disconnected and
@@ -273,6 +295,7 @@ struct uvc_stitcher {
 	struct completion engine_started;
 	int engine_start_ret;
 	u32 frame_size;
+	unsigned long src_timeout;
 	unsigned int num_dmabuf_slots;
 	struct stitcher_dmabuf_slot dma_slots[STITCHER_MAX_OUT_BUFS];
 	struct vb2_buffer *out_vb_map[STITCHER_MAX_OUT_BUFS];
@@ -547,8 +570,7 @@ static struct dma_buf *stitcher_create_dmabuf(struct page **pages,
 }
 
 static int stitcher_dqbuf_src_dmabuf(struct uvc_stitcher *stitcher, int slot,
-				     unsigned int *out_index, u32 *out_sequence,
-				     ktime_t *out_ts)
+				     struct stitcher_dq *dq)
 {
 	struct stitcher_slot *src = &stitcher->src[slot];
 	struct v4l2_buffer buf = {
@@ -579,13 +601,12 @@ static int stitcher_dqbuf_src_dmabuf(struct uvc_stitcher *stitcher, int slot,
 		return -ENODEV;
 	}
 
-	*out_index = buf.index;
-	if (out_sequence)
-		*out_sequence = buf.sequence;
-	if (out_ts)
-		*out_ts =
-			ns_to_ktime((u64)buf.timestamp.tv_sec * NSEC_PER_SEC +
-				    (u64)buf.timestamp.tv_usec * NSEC_PER_USEC);
+	dq->index = buf.index;
+	dq->sequence = buf.sequence;
+	dq->flags = buf.flags;
+	dq->bytesused = buf.bytesused;
+	dq->ts = ns_to_ktime((u64)buf.timestamp.tv_sec * NSEC_PER_SEC +
+			     (u64)buf.timestamp.tv_usec * NSEC_PER_USEC);
 	return 0;
 }
 
@@ -971,33 +992,209 @@ static void stitcher_uvc_free_bufs(struct uvc_stitcher *stitcher, int idx)
 /*
  * Output buffer pages are exported as dma_buf and queued to the UVC
  * sources, which write their half directly into the output buffer.  The
- * kthread only pairs up completed halves and returns the output buffer.
+ * kthread pairs up completed halves and returns the output buffer.
  *
- * @inflight is a bitmap of output buffers currently owned by the sources.
- * It is private to the kthread.
+ * A source can stop by itself: when its bulk URBs fail (the EJ535 does
+ * this with -EPROTO right after STREAMON now and then), uvcvideo returns
+ * every queued buffer with an error and never resubmits the URBs, so no
+ * further frame arrives.  The kthread therefore watches both sources at
+ * the same time and restarts them as soon as one of them
+ *   - returns a cancelled buffer (error flag, nothing written),
+ *   - returns STITCHER_ERR_BURST corrupt frames in a row, or
+ *   - stays silent while the other source keeps delivering.
  */
-static int stitcher_qbuf_pair(struct uvc_stitcher *stitcher, unsigned int idx)
-{
-	int s, ret;
 
+struct stitcher_engine;
+
+/* Wait queue entry the kthread adds to every queue it watches */
+struct stitcher_waiter {
+	struct wait_queue_entry wait;
+	wait_queue_head_t *head;
+	struct stitcher_engine *e;
+};
+
+enum stitcher_fault {
+	STITCHER_FAULT_NONE,
+	STITCHER_FAULT_CANCELLED,
+	STITCHER_FAULT_CORRUPT,
+	STITCHER_FAULT_SILENT,
+	STITCHER_FAULT_SEQUENCE,
+	STITCHER_FAULT_RETRY,
+};
+
+static const char *const stitcher_fault_name[] = {
+	[STITCHER_FAULT_NONE] = "ok",
+	[STITCHER_FAULT_CANCELLED] = "stopped (buffers cancelled)",
+	[STITCHER_FAULT_CORRUPT] = "keeps returning corrupt frames",
+	[STITCHER_FAULT_SILENT] = "stopped delivering frames",
+	[STITCHER_FAULT_SEQUENCE] = "out of sync",
+	[STITCHER_FAULT_RETRY] = "failed to restart",
+};
+
+/* State of one kthread run; allocated by the kthread */
+struct stitcher_engine {
+	struct uvc_stitcher *stitcher;
+	struct stitcher_out *out;
+
+	/* Output buffers handed to the sources and not completed yet */
+	unsigned long inflight;
+	/* Buffers queued to each source and not dequeued yet */
+	unsigned long queued[STITCHER_NUM_SOURCES];
+	/* Dequeued halves waiting for the other source, oldest first */
+	struct stitcher_dq half[STITCHER_NUM_SOURCES][STITCHER_MAX_OUT_BUFS];
+	unsigned int nhalf[STITCHER_NUM_SOURCES];
+	unsigned int err_run[STITCHER_NUM_SOURCES];
+	/* jiffies: start of the silence window, and last dequeue */
+	unsigned long armed[STITCHER_NUM_SOURCES];
+	unsigned long last_rx[STITCHER_NUM_SOURCES];
+	unsigned long timeout;
+
+	bool synced;
+	unsigned int warm_pairs;
+	unsigned int warm_attempts;
+
+	/* Restarts since the last completed output frame */
+	unsigned int restarts;
+	bool restart_pending;
+	ktime_t fault_time;
+
+	/* Wake-ups from both sources and from the output queue */
+	poll_table pt;
+	bool triggered;
+	bool watch_overflow;
+	unsigned int nwaiters;
+	struct stitcher_waiter
+		waiters[STITCHER_NUM_SOURCES * STITCHER_WATCH_HEADS + 1];
+};
+
+/* Runs in the waker's context, possibly in an interrupt */
+static int stitcher_wake(struct wait_queue_entry *wait, unsigned int mode,
+			 int sync, void *key)
+{
+	struct stitcher_waiter *w =
+		container_of(wait, struct stitcher_waiter, wait);
+
+	/* Pairs with smp_store_mb() in stitcher_wait() */
+	smp_wmb();
+	WRITE_ONCE(w->e->triggered, true);
+	return default_wake_function(wait, mode, sync, key);
+}
+
+static void stitcher_add_waiter(struct stitcher_engine *e,
+				wait_queue_head_t *head)
+{
+	struct stitcher_waiter *w;
+
+	if (e->nwaiters == ARRAY_SIZE(e->waiters)) {
+		e->watch_overflow = true;
+		return;
+	}
+
+	w = &e->waiters[e->nwaiters++];
+	w->head = head;
+	w->e = e;
+	init_waitqueue_func_entry(&w->wait, stitcher_wake);
+	w->wait.private = current;
+	add_wait_queue(head, &w->wait);
+}
+
+/* poll_table callback: the source's poll() reports each queue it uses */
+static void stitcher_watch_queue(struct file *file, wait_queue_head_t *head,
+				 poll_table *pt)
+{
+	stitcher_add_waiter(container_of(pt, struct stitcher_engine, pt), head);
+}
+
+/*
+ * Get woken up by both sources, the same way poll() would, and by the
+ * output queue.  The entries stay until stitcher_unwatch(), which runs
+ * before the kthread exits; the source files and the output queue both
+ * outlive the kthread.
+ */
+static int stitcher_watch(struct stitcher_engine *e)
+{
+	struct uvc_stitcher *stitcher = e->stitcher;
+	unsigned int before;
+	int s;
+
+	init_poll_funcptr(&e->pt, stitcher_watch_queue);
 	for (s = 0; s < STITCHER_NUM_SOURCES; s++) {
-		ret = stitcher_qbuf_src_dmabuf(
-			stitcher, s, idx, stitcher->dma_slots[idx].cached_fd[s]);
-		if (ret)
-			return ret;
+		before = e->nwaiters;
+		vfs_poll(stitcher->src[s].filp, &e->pt);
+		if (e->nwaiters == before) {
+			pr_err("uvc_stitcher: cannot watch src%d\n", s);
+			return -ENODEV;
+		}
+	}
+	stitcher_add_waiter(e, &e->out->q.buf_wq);
+
+	if (e->watch_overflow) {
+		pr_err("uvc_stitcher: too many wait queues to watch\n");
+		return -EINVAL;
 	}
 	return 0;
 }
 
-/* Hand the output buffers queued by userspace to both sources. */
-static int stitcher_submit_queued(struct uvc_stitcher *stitcher,
-				  struct stitcher_out *out,
-				  unsigned long *inflight)
+static void stitcher_unwatch(struct stitcher_engine *e)
 {
+	struct stitcher_waiter *w;
+
+	while (e->nwaiters) {
+		w = &e->waiters[--e->nwaiters];
+		remove_wait_queue(w->head, &w->wait);
+	}
+}
+
+/* Sleep until a watched queue has news, @timeout passes or we must stop. */
+static void stitcher_wait(struct stitcher_engine *e, long timeout)
+{
+	set_current_state(TASK_INTERRUPTIBLE);
+	if (!READ_ONCE(e->triggered) && !stitcher_should_stop(e->stitcher))
+		schedule_timeout(timeout);
+	__set_current_state(TASK_RUNNING);
+	/* Pairs with smp_wmb() in stitcher_wake() */
+	smp_store_mb(e->triggered, false);
+}
+
+static bool stitcher_src_detached(struct uvc_stitcher *stitcher)
+{
+	int s;
+
+	for (s = 0; s < STITCHER_NUM_SOURCES; s++)
+		if (interface_to_usbdev(stitcher->src[s].intf)->state ==
+		    USB_STATE_NOTATTACHED)
+			return true;
+	return false;
+}
+
+/* QBUF one half of output buffer @idx to source @s. */
+static int stitcher_queue_half(struct stitcher_engine *e, int s,
+			       unsigned int idx)
+{
+	struct uvc_stitcher *stitcher = e->stitcher;
+	int ret;
+
+	ret = stitcher_qbuf_src_dmabuf(stitcher, s, idx,
+				       stitcher->dma_slots[idx].cached_fd[s]);
+	if (ret)
+		return ret;
+
+	/* A source that had nothing to do starts a new silence window */
+	if (!e->queued[s])
+		e->armed[s] = jiffies;
+	__set_bit(idx, &e->queued[s]);
+	return 0;
+}
+
+/* Hand the output buffers queued by userspace to both sources. */
+static int stitcher_submit_queued(struct stitcher_engine *e)
+{
+	struct uvc_stitcher *stitcher = e->stitcher;
+	struct stitcher_out *out = e->out;
 	struct stitcher_video_buffer *mbuf;
 	unsigned long flags;
 	unsigned int idx;
-	int ret;
+	int s, ret;
 
 	for (;;) {
 		spin_lock_irqsave(&out->q.irqlock, flags);
@@ -1013,68 +1210,282 @@ static int stitcher_submit_queued(struct uvc_stitcher *stitcher,
 
 		idx = mbuf->buf.vb2_buf.index;
 		if (idx >= stitcher->num_dmabuf_slots ||
-		    test_bit(idx, inflight)) {
+		    test_bit(idx, &e->inflight)) {
 			pr_err("uvc_stitcher: cannot submit output buffer %u\n",
 			       idx);
 			return -EINVAL;
 		}
 
-		ret = stitcher_qbuf_pair(stitcher, idx);
-		if (ret)
-			return ret;
-		__set_bit(idx, inflight);
+		for (s = 0; s < STITCHER_NUM_SOURCES; s++) {
+			ret = stitcher_queue_half(e, s, idx);
+			if (ret)
+				return ret;
+		}
+		__set_bit(idx, &e->inflight);
 	}
 }
 
-/* Re-QBUF both halves after a DQBUF pair was discarded. */
-static int stitcher_requeue_pair_dmabuf(struct uvc_stitcher *stitcher,
-					unsigned int idx0, unsigned int idx1)
+/*
+ * Dequeue every buffer source @s has ready.  Sets *fault and stops when
+ * @s has to be restarted.
+ */
+static int stitcher_collect(struct stitcher_engine *e, int s,
+			    enum stitcher_fault *fault, bool *busy)
 {
+	struct uvc_stitcher *stitcher = e->stitcher;
+	struct stitcher_dq dq;
 	int ret;
 
-	ret = stitcher_qbuf_src_dmabuf(stitcher, 0, idx0,
-				       stitcher->dma_slots[idx0].cached_fd[0]);
-	if (ret)
-		return ret;
-	return stitcher_qbuf_src_dmabuf(stitcher, 1, idx1,
-					stitcher->dma_slots[idx1].cached_fd[1]);
-}
+	while (e->queued[s]) {
+		/* EPOLLERR: not streaming any more; DQBUF reports why */
+		if (!(vfs_poll(stitcher->src[s].filp, NULL) &
+		      (EPOLLIN | EPOLLERR)))
+			return 0;
 
-/* DQBUF one buffer from each source (blocking). Any error is fatal. */
-static int stitcher_dqbuf_pair(struct uvc_stitcher *stitcher,
-			       unsigned long inflight, unsigned int *idx,
-			       u32 *seq, ktime_t *ts)
-{
-	int s, ret;
-
-	for (s = 0; s < STITCHER_NUM_SOURCES; s++) {
-		ret = stitcher_dqbuf_src_dmabuf(stitcher, s, &idx[s], &seq[s],
-						&ts[s]);
+		ret = stitcher_dqbuf_src_dmabuf(stitcher, s, &dq);
 		if (ret)
 			return ret;
+		*busy = true;
 
-		if (idx[s] >= stitcher->num_dmabuf_slots ||
-		    !test_bit(idx[s], &inflight)) {
+		if (dq.index >= stitcher->num_dmabuf_slots ||
+		    !test_bit(dq.index, &e->queued[s])) {
 			pr_err("uvc_stitcher: src%d returned unexpected buffer %u\n",
-			       s, idx[s]);
+			       s, dq.index);
 			return -EIO;
 		}
+		__clear_bit(dq.index, &e->queued[s]);
+		e->armed[s] = jiffies;
+		e->last_rx[s] = e->armed[s];
+
+		if (dq.flags & V4L2_BUF_FLAG_ERROR) {
+			/*
+			 * vb2 clears bytesused at QBUF and only uvcvideo's
+			 * frame completion sets it, so an empty error buffer
+			 * was cancelled: the source's URBs are gone.
+			 */
+			if (!dq.bytesused) {
+				*fault = STITCHER_FAULT_CANCELLED;
+				return 0;
+			}
+			if (++e->err_run[s] >= STITCHER_ERR_BURST) {
+				*fault = STITCHER_FAULT_CORRUPT;
+				return 0;
+			}
+		} else {
+			e->err_run[s] = 0;
+		}
+
+		/* Each buffer is dequeued once per QBUF, so this fits */
+		e->half[s][e->nhalf[s]++] = dq;
 	}
 	return 0;
 }
 
-/**
- * stitcher_dmabuf_resync_sources - STREAMOFF + re-QBUF + STREAMON both sources.
- *
- * Resets both UVC sources so their sequence counters restart at 0.
- * Only buffers in @inflight are re-queued; buffers owned by userspace are
- * left alone.
- */
-static int stitcher_dmabuf_resync_sources(struct uvc_stitcher *stitcher,
-					  unsigned long inflight)
+static void stitcher_pop_half(struct stitcher_engine *e, int s,
+			      struct stitcher_dq *dq)
 {
-	unsigned int i, s;
-	int ret = 0;
+	*dq = e->half[s][0];
+	e->nhalf[s]--;
+	memmove(&e->half[s][0], &e->half[s][1],
+		e->nhalf[s] * sizeof(e->half[s][0]));
+}
+
+/* Both halves of output buffer p->index are filled: return it. */
+static void stitcher_complete(struct stitcher_engine *e,
+			      const struct stitcher_dq *p,
+			      const struct stitcher_dq *s)
+{
+	struct uvc_stitcher *stitcher = e->stitcher;
+	struct vb2_buffer *out_vb = stitcher->out_vb_map[p->index];
+	struct vb2_v4l2_buffer *v4l2_vb = to_vb2_v4l2_buffer(out_vb);
+
+	__clear_bit(p->index, &e->inflight);
+	vb2_set_plane_payload(out_vb, 0, stitcher->frame_size);
+	out_vb->timestamp = ktime_to_ns(ktime_before(p->ts, s->ts) ? p->ts :
+								    s->ts);
+	v4l2_vb->sequence = p->sequence;
+	v4l2_vb->field = V4L2_FIELD_NONE;
+	vb2_buffer_done(out_vb, VB2_BUF_STATE_DONE);
+
+	if (e->fault_time) {
+		pr_info("uvc_stitcher: recovered %lld ms after the fault (%u restart(s))\n",
+			ktime_ms_delta(ktime_get(), e->fault_time), e->restarts);
+		e->fault_time = 0;
+	}
+	e->restarts = 0;
+}
+
+/*
+ * After a (re)start, drain STITCHER_SYNC_DRAIN_FRAMES pairs and check that
+ * both sources reached the same frame.  At STREAMON the two sources may
+ * start at different times (alt-setting switch latency).
+ */
+static int stitcher_warmup(struct stitcher_engine *e,
+			   const struct stitcher_dq *p,
+			   const struct stitcher_dq *s,
+			   enum stitcher_fault *fault)
+{
+	int ret;
+
+	ret = stitcher_queue_half(e, 0, p->index);
+	if (!ret)
+		ret = stitcher_queue_half(e, 1, s->index);
+	if (ret)
+		return ret;
+
+	if (++e->warm_pairs < STITCHER_SYNC_DRAIN_FRAMES)
+		return 0;
+
+	if (p->sequence != s->sequence &&
+	    e->warm_attempts < STITCHER_SYNC_MAX_RETRIES) {
+		pr_warn("uvc_stitcher: sequence mismatch after draining %d frames: "
+			"src0 seq=%u vs src1 seq=%u (attempt %u)\n",
+			STITCHER_SYNC_DRAIN_FRAMES, p->sequence, s->sequence,
+			e->warm_attempts);
+		e->warm_attempts++;
+		*fault = STITCHER_FAULT_SEQUENCE;
+		return 0;
+	}
+
+	if (p->sequence == s->sequence)
+		pr_info("uvc_stitcher: synced at seq %u (attempt %u, drained %d)\n",
+			p->sequence, e->warm_attempts,
+			STITCHER_SYNC_DRAIN_FRAMES);
+	else
+		pr_warn("uvc_stitcher: sync failed after %d retries (seq %u vs %u), proceeding\n",
+			STITCHER_SYNC_MAX_RETRIES, p->sequence, s->sequence);
+
+	e->synced = true;
+	e->warm_attempts = 0;
+	return 0;
+}
+
+/* Pair dequeued halves and return the completed output buffers. */
+static int stitcher_pair(struct stitcher_engine *e, enum stitcher_fault *fault,
+			 bool *busy)
+{
+	struct stitcher_dq p, s;
+	unsigned int offset;
+	int ret;
+
+	while (e->nhalf[0] && e->nhalf[1]) {
+		stitcher_pop_half(e, 0, &p);
+		stitcher_pop_half(e, 1, &s);
+		*busy = true;
+
+		/* Halves of different output buffers: give both back */
+		if (p.index != s.index) {
+			pr_warn_ratelimited("uvc_stitcher: DQBUF index mismatch %u vs %u\n",
+					    p.index, s.index);
+			ret = stitcher_queue_half(e, 0, p.index);
+			if (!ret)
+				ret = stitcher_queue_half(e, 1, s.index);
+			if (ret)
+				return ret;
+			continue;
+		}
+
+		if (!e->synced) {
+			ret = stitcher_warmup(e, &p, &s, fault);
+			if (ret || *fault)
+				return ret;
+			continue;
+		}
+
+		if (p.sequence != s.sequence) {
+			offset = (p.sequence > s.sequence) ?
+					 (p.sequence - s.sequence) :
+					 (s.sequence - p.sequence);
+			if (offset > STITCHER_SEQ_MISMATCH_THRESHOLD) {
+				pr_warn_ratelimited("uvc_stitcher: DQBUF sequence mismatch %u vs %u (offset %u)\n",
+						    p.sequence, s.sequence,
+						    offset);
+				/* p.index stays in flight; the restart requeues it */
+				*fault = STITCHER_FAULT_SEQUENCE;
+				return 0;
+			}
+
+			pr_info_ratelimited("uvc_stitcher: seq mismatch %u vs %u, offset %u\n",
+					    p.sequence, s.sequence, offset);
+		}
+
+		stitcher_complete(e, &p, &s);
+	}
+	return 0;
+}
+
+/*
+ * Source that is silent while the other one has delivered something since
+ * the silence began, or -1.  When both are silent (no input signal, for
+ * instance) restarting would not help.
+ */
+static int stitcher_silent_src(struct stitcher_engine *e)
+{
+	unsigned long now = jiffies;
+	int s;
+
+	for (s = 0; s < STITCHER_NUM_SOURCES; s++)
+		if (e->queued[s] && time_after(now, e->armed[s] + e->timeout) &&
+		    time_after(e->last_rx[!s], e->armed[s]))
+			return s;
+	return -1;
+}
+
+/* How long to sleep before the silence check has to run again. */
+static long stitcher_next_check(struct stitcher_engine *e)
+{
+	unsigned long now = jiffies, due;
+	long wait = MAX_SCHEDULE_TIMEOUT;
+	int s;
+
+	for (s = 0; s < STITCHER_NUM_SOURCES; s++) {
+		if (!e->queued[s])
+			continue;
+		due = e->armed[s] + e->timeout;
+		/* Overdue but not restartable: look again a window later */
+		wait = min_t(long, wait,
+			     time_after(due, now) ? due - now : e->timeout);
+	}
+	return wait;
+}
+
+/*
+ * Restart both sources: STREAMOFF, re-QBUF every buffer in flight,
+ * STREAMON.  The UVC sequence counters restart at 0, so the warm-up runs
+ * again.  Restarts that keep failing are spaced out.
+ */
+static int stitcher_restart(struct stitcher_engine *e,
+			    enum stitcher_fault fault, int src)
+{
+	struct uvc_stitcher *stitcher = e->stitcher;
+	unsigned long deadline, now;
+	unsigned int i, ms;
+	int s, ret = 0;
+	long left;
+
+	if (src >= 0)
+		pr_warn_ratelimited("uvc_stitcher: src%d %s, restarting sources\n",
+				    src, stitcher_fault_name[fault]);
+	else
+		pr_warn_ratelimited("uvc_stitcher: sources %s, restarting\n",
+				    stitcher_fault_name[fault]);
+
+	if (!e->fault_time)
+		e->fault_time = ktime_get();
+
+	if (e->restarts >= STITCHER_RESTART_FAST) {
+		ms = STITCHER_RESTART_BACKOFF_MS
+		     << min(e->restarts - STITCHER_RESTART_FAST, 4u);
+		ms = min_t(unsigned int, ms, STITCHER_RESTART_BACKOFF_MAX_MS);
+		deadline = jiffies + msecs_to_jiffies(ms);
+		while (!stitcher_should_stop(stitcher)) {
+			left = (long)(deadline - jiffies);
+			if (left <= 0)
+				break;
+			stitcher_wait(e, left);
+		}
+	}
+	e->restarts++;
 
 	mutex_lock(&stitcher->src_stream_lock);
 
@@ -1082,186 +1493,121 @@ static int stitcher_dmabuf_resync_sources(struct uvc_stitcher *stitcher,
 	if (!atomic_read(&stitcher->streaming))
 		goto out;
 
-	/* STREAMOFF both — stops URBs, resets UVC state */
-	for (s = 0; s < STITCHER_NUM_SOURCES; s++)
+	/* STREAMOFF also gives back every buffer still queued */
+	for (s = 0; s < STITCHER_NUM_SOURCES; s++) {
 		stitcher_uvc_streamoff_only(stitcher, s);
+		e->queued[s] = 0;
+		e->nhalf[s] = 0;
+		e->err_run[s] = 0;
+	}
 
-	for_each_set_bit(i, &inflight, STITCHER_MAX_OUT_BUFS) {
-		ret = stitcher_qbuf_pair(stitcher, i);
-		if (ret) {
-			pr_err("uvc_stitcher: resync re-QBUF slot %u failed: %d\n",
-			       i, ret);
-			goto out;
+	for_each_set_bit(i, &e->inflight, STITCHER_MAX_OUT_BUFS) {
+		for (s = 0; s < STITCHER_NUM_SOURCES; s++) {
+			ret = stitcher_queue_half(e, s, i);
+			if (ret)
+				goto out;
 		}
 	}
 
-	/* STREAMON both — UVC resets sequence counter, submits URBs */
 	for (s = 0; s < STITCHER_NUM_SOURCES; s++) {
 		ret = stitcher_uvc_streamon(stitcher, s);
 		if (ret)
-			goto out;
+			break;
 	}
+
+	if (ret) {
+		/* Leave both sources off and try again later */
+		for (s = 0; s < STITCHER_NUM_SOURCES; s++) {
+			stitcher_uvc_streamoff_only(stitcher, s);
+			e->queued[s] = 0;
+		}
+		if (stitcher_src_detached(stitcher)) {
+			ret = -ENODEV;
+			goto out;
+		}
+		e->restart_pending = true;
+		ret = 0;
+		goto out;
+	}
+	e->restart_pending = false;
+
+	now = jiffies;
+	for (s = 0; s < STITCHER_NUM_SOURCES; s++) {
+		e->armed[s] = now;
+		e->last_rx[s] = now;
+	}
+	e->synced = false;
+	e->warm_pairs = 0;
+	if (fault != STITCHER_FAULT_SEQUENCE)
+		e->warm_attempts = 0;
 
 out:
 	mutex_unlock(&stitcher->src_stream_lock);
 	return ret;
 }
 
-/**
- * stitcher_warmup_sync - drain initial frame pairs and check sequence numbers.
- *
- * At STREAMON the 2 sources may start at different times (alt-setting switch
- * latency) and a transient -EPROTO can widen the gap.
- *
- * fix:
- * - Drain N pairs of frames, then compare sequence numbers.
- * - If the sequence don't match, attempt a resync and retry.
+/*
+ * Main loop.  Returns 0 when asked to stop, or a negative error when
+ * streaming cannot continue.
  */
-static int stitcher_warmup_sync(struct uvc_stitcher *stitcher,
-				unsigned long inflight)
+static int stitcher_run(struct stitcher_engine *e)
 {
-	unsigned int idx[STITCHER_NUM_SOURCES];
-	u32 seq[STITCHER_NUM_SOURCES] = {};
-	ktime_t ts[STITCHER_NUM_SOURCES];
-	int attempt, n, ret;
-
-	for (attempt = 0; attempt <= STITCHER_SYNC_MAX_RETRIES; attempt++) {
-		for (n = 0; n < STITCHER_SYNC_DRAIN_FRAMES; n++) {
-			ret = stitcher_dqbuf_pair(stitcher, inflight, idx, seq,
-						  ts);
-			if (ret)
-				return ret;
-
-			ret = stitcher_requeue_pair_dmabuf(stitcher, idx[0],
-							   idx[1]);
-			if (ret)
-				return ret;
-		}
-
-		if (seq[0] == seq[1]) {
-			pr_info("uvc_stitcher: synced at seq %u (attempt %d, drained %d)\n",
-				seq[0], attempt, STITCHER_SYNC_DRAIN_FRAMES);
-			return 0;
-		}
-
-		if (attempt < STITCHER_SYNC_MAX_RETRIES) {
-			pr_warn("uvc_stitcher: sequence mismatch after draining %d frames: "
-				"src0 seq=%u vs src1 seq=%u (attempt %d)\n",
-				STITCHER_SYNC_DRAIN_FRAMES, seq[0], seq[1],
-				attempt);
-			ret = stitcher_dmabuf_resync_sources(stitcher,
-							     inflight);
-			if (ret) {
-				pr_err("uvc_stitcher: failed to resync sources: %d\n",
-				       ret);
-				return ret;
-			}
-		}
-	}
-
-	pr_warn("uvc_stitcher: sync failed after %d retries (seq %u vs %u), proceeding\n",
-		STITCHER_SYNC_MAX_RETRIES, seq[0], seq[1]);
-	return 0;
-}
-
-/**
- * stitcher_dma - main loop.  Returns 0 when asked to stop, or a negative
- * error when streaming cannot continue.
- */
-static int stitcher_dma(struct uvc_stitcher *stitcher, struct stitcher_out *out,
-			unsigned long *inflight)
-{
-	struct vb2_v4l2_buffer *v4l2_vb;
-	struct vb2_buffer *out_vb;
-	unsigned int idx[STITCHER_NUM_SOURCES], offset;
-	u32 seq[STITCHER_NUM_SOURCES];
-	ktime_t ts[STITCHER_NUM_SOURCES];
-	bool synced = false;
-	int ret;
+	struct uvc_stitcher *stitcher = e->stitcher;
+	enum stitcher_fault fault;
+	int s, src, ret;
+	bool busy;
 
 	while (!stitcher_should_stop(stitcher)) {
-		wait_event_interruptible(out->q.buf_wq,
-					 *inflight ||
-						 !list_empty(&out->q.irqqueue) ||
-						 stitcher_should_stop(stitcher));
-		if (stitcher_should_stop(stitcher))
-			break;
+		fault = STITCHER_FAULT_NONE;
+		src = -1;
+		busy = false;
 
 		/* Submit output buffers that userspace (re-)queued */
-		ret = stitcher_submit_queued(stitcher, out, inflight);
-		if (ret)
-			return ret;
-		if (!*inflight)
-			continue;
-
-		/* Sync once, as soon as the sources own some buffers */
-		if (!synced) {
-			ret = stitcher_warmup_sync(stitcher, *inflight);
-			if (ret)
-				return ret;
-			synced = true;
-			continue;
-		}
-
-		ret = stitcher_dqbuf_pair(stitcher, *inflight, idx, seq, ts);
+		ret = stitcher_submit_queued(e);
 		if (ret)
 			return ret;
 
-		/* Discard mismatched pairs */
-		if (idx[0] != idx[1]) {
-			pr_warn("uvc_stitcher: DQBUF index mismatch %u vs %u\n",
-				idx[0], idx[1]);
-			ret = stitcher_requeue_pair_dmabuf(stitcher, idx[0],
-							   idx[1]);
-			if (ret)
-				return ret;
-			continue;
-		}
-
-		if (seq[0] != seq[1]) {
-			offset = (seq[0] > seq[1]) ? (seq[0] - seq[1]) :
-						     (seq[1] - seq[0]);
-			if (offset > STITCHER_SEQ_MISMATCH_THRESHOLD) {
-				pr_warn("uvc_stitcher: DQBUF sequence mismatch %u vs %u (offset %u), resyncing sources\n",
-					seq[0], seq[1], offset);
-				/* idx[0] is still in flight; resync re-queues it */
-				ret = stitcher_dmabuf_resync_sources(
-					stitcher, *inflight);
-				if (ret) {
-					pr_err("uvc_stitcher: failed to resync sources: %d\n",
-					       ret);
+		if (e->restart_pending) {
+			fault = STITCHER_FAULT_RETRY;
+		} else {
+			for (s = 0; s < STITCHER_NUM_SOURCES && !fault; s++) {
+				ret = stitcher_collect(e, s, &fault, &busy);
+				if (ret)
 					return ret;
-				}
-				continue;
+				if (fault)
+					src = s;
 			}
-
-			pr_info_ratelimited(
-				"uvc_stitcher: seq mismatch %u vs %u, "
-				"offset %u\n",
-				seq[0], seq[1], offset);
+			if (!fault) {
+				ret = stitcher_pair(e, &fault, &busy);
+				if (ret)
+					return ret;
+			}
+			if (!fault) {
+				src = stitcher_silent_src(e);
+				if (src >= 0)
+					fault = STITCHER_FAULT_SILENT;
+			}
 		}
 
-		/* Both halves of output buffer idx[0] are filled — signal done */
-		__clear_bit(idx[0], inflight);
-		out_vb = stitcher->out_vb_map[idx[0]];
-		v4l2_vb = to_vb2_v4l2_buffer(out_vb);
-		vb2_set_plane_payload(out_vb, 0, stitcher->frame_size);
+		if (fault) {
+			ret = stitcher_restart(e, fault, src);
+			if (ret)
+				return ret;
+			continue;
+		}
 
-		out_vb->timestamp =
-			ktime_to_ns(ktime_before(ts[0], ts[1]) ? ts[0] : ts[1]);
-		v4l2_vb->sequence = seq[0];
-		v4l2_vb->field = V4L2_FIELD_NONE;
-		vb2_buffer_done(out_vb, VB2_BUF_STATE_DONE);
+		if (!busy)
+			stitcher_wait(e, stitcher_next_check(e));
 	}
 
 	return 0;
 }
 
 /* Install fds, queue the initial buffers and turn both sources on. */
-static int stitcher_engine_prepare(struct uvc_stitcher *stitcher,
-				   struct stitcher_out *out,
-				   unsigned long *inflight)
+static int stitcher_engine_prepare(struct stitcher_engine *e)
 {
+	struct uvc_stitcher *stitcher = e->stitcher;
+	unsigned long now;
 	int s, ret;
 
 	ret = stitcher_dmabuf_create_cached_fds(stitcher);
@@ -1270,7 +1616,12 @@ static int stitcher_engine_prepare(struct uvc_stitcher *stitcher,
 		return ret;
 	}
 
-	ret = stitcher_submit_queued(stitcher, out, inflight);
+	/* Before STREAMON, so that no wake-up is missed */
+	ret = stitcher_watch(e);
+	if (ret)
+		return ret;
+
+	ret = stitcher_submit_queued(e);
 	if (ret)
 		return ret;
 
@@ -1282,31 +1633,48 @@ static int stitcher_engine_prepare(struct uvc_stitcher *stitcher,
 	}
 	mutex_unlock(&stitcher->src_stream_lock);
 
+	now = jiffies;
+	for (s = 0; s < STITCHER_NUM_SOURCES; s++) {
+		e->armed[s] = now;
+		e->last_rx[s] = now;
+	}
 	return ret;
 }
 
 static int stitcher_thread_fn(void *data)
 {
 	struct uvc_stitcher *stitcher = data;
-	struct stitcher_out *out = stitcher->engine_out;
-	unsigned long inflight = 0;
+	struct stitcher_engine *e;
 	int ret;
 
 	sched_set_fifo(current);
 
-	ret = stitcher_engine_prepare(stitcher, out, &inflight);
+	e = kzalloc(sizeof(*e), GFP_KERNEL);
+	if (e) {
+		e->stitcher = stitcher;
+		e->out = stitcher->engine_out;
+		e->timeout = stitcher->src_timeout;
+		ret = stitcher_engine_prepare(e);
+	} else {
+		ret = -ENOMEM;
+	}
 	stitcher->engine_start_ret = ret;
 	complete(&stitcher->engine_started);
 
 	if (!ret) {
-		ret = stitcher_dma(stitcher, out, &inflight);
+		ret = stitcher_run(e);
 		if (ret && !stitcher_should_stop(stitcher)) {
 			/* Make DQBUF/poll on the output node fail with -EIO */
 			pr_err("uvc_stitcher: streaming aborted: %d\n", ret);
-			vb2_queue_error(&out->q.vbq);
+			vb2_queue_error(&e->out->q.vbq);
 		}
 	}
 
+	/* No wake-up may reach @e once it is freed */
+	if (e) {
+		stitcher_unwatch(e);
+		kfree(e);
+	}
 	stitcher_dmabuf_close_cached_fds(stitcher);
 
 	/*
@@ -1346,8 +1714,8 @@ static void stitcher_engine_stop(struct uvc_stitcher *stitcher)
 	atomic_set(&stitcher->streaming, 0);
 
 	/*
-	 * STREAMOFF unblocks the kthread's DQBUF.  src_stream_lock keeps a
-	 * resync in the kthread from turning the sources back on.
+	 * STREAMOFF wakes the kthread up.  src_stream_lock keeps a restart
+	 * in the kthread from turning the sources back on.
 	 */
 	mutex_lock(&stitcher->src_stream_lock);
 	for (i = 0; i < STITCHER_NUM_SOURCES; i++)
@@ -1456,6 +1824,13 @@ static int stitcher_engine_start(struct uvc_stitcher *stitcher,
 		if (ret)
 			goto err_stop;
 	}
+
+	/* A source silent for this long while the other delivers is restarted */
+	stitcher->src_timeout = msecs_to_jiffies(max_t(
+		u64, STITCHER_SRC_TIMEOUT_MS,
+		div_u64((u64)out->timeperframe.numerator * MSEC_PER_SEC *
+				STITCHER_SRC_TIMEOUT_FRAMES,
+			out->timeperframe.denominator)));
 
 	/* Export each output buffer's two halves as dma_bufs */
 	stitcher->frame_size = frame_size;

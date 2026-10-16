@@ -34,8 +34,8 @@
 /* ------------------------------------------------------------------ */
 /* iosys_map was renamed from dma_buf_map in v5.18 (commit 7938f4218168). */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
-#define iosys_map		dma_buf_map
-#define iosys_map_set_vaddr	dma_buf_map_set_vaddr
+#define iosys_map dma_buf_map
+#define iosys_map_set_vaddr dma_buf_map_set_vaddr
 #endif
 
 /*
@@ -65,13 +65,14 @@ static inline unsigned int vb2_get_num_buffers(struct vb2_queue *q)
 #define STITCHER_SEQ_MISMATCH_THRESHOLD 2
 
 /* Restarting a source that stopped (see the kthread section) */
-#define STITCHER_ERR_BURST 2		/* corrupt frames in a row */
-#define STITCHER_SRC_TIMEOUT_MS 250	/* minimum silence before a restart */
-#define STITCHER_SRC_TIMEOUT_FRAMES 8	/* ... or this many frame periods */
-#define STITCHER_RESTART_FAST 3		/* immediate restarts before backing off */
+#define STITCHER_ERR_BURST 2 /* corrupt frames in a row */
+#define STITCHER_SRC_TIMEOUT_MS 250 /* minimum silence before a restart */
+#define STITCHER_SRC_TIMEOUT_FRAMES 8 /* ... or this many frame periods */
+#define STITCHER_SRC_TIMEOUT_MAX_MS 10000
+#define STITCHER_RESTART_FAST 3 /* immediate restarts before backing off */
 #define STITCHER_RESTART_BACKOFF_MS 100
 #define STITCHER_RESTART_BACKOFF_MAX_MS 1000
-#define STITCHER_WATCH_HEADS 4		/* wait queues a source's poll() may use */
+#define STITCHER_WATCH_HEADS 4 /* wait queues a source's poll() may use */
 
 /* Limits for the format list copied from the S-side source */
 #define STITCHER_MAX_FRMSIZES 16
@@ -124,8 +125,8 @@ static inline unsigned int vb2_get_num_buffers(struct vb2_queue *q)
  */
 struct stitcher_pixfmt {
 	u32 fourcc;
-	u32 bpl_mul;	/* bytesperline = width * bpl_mul */
-	u32 size_num;	/* sizeimage = width * height * size_num / size_den */
+	u32 bpl_mul; /* bytesperline = width * bpl_mul */
+	u32 size_num; /* sizeimage = width * height * size_num / size_den */
 	u32 size_den;
 };
 
@@ -354,8 +355,8 @@ static inline u32 stitcher_bytesperline(const struct stitcher_pixfmt *info,
 }
 
 /* Sizes in the format list are checked against this at registration. */
-static inline u64 stitcher_image_size(const struct stitcher_pixfmt *info,
-				      u32 w, u32 h)
+static inline u64 stitcher_image_size(const struct stitcher_pixfmt *info, u32 w,
+				      u32 h)
 {
 	return (u64)w * h * info->size_num / info->size_den;
 }
@@ -1060,7 +1061,7 @@ struct stitcher_engine {
 
 	/* Wake-ups from both sources and from the output queue */
 	poll_table pt;
-	bool triggered;
+	int triggered; /* int, as in fs/select.c, for smp_store_mb() */
 	bool watch_overflow;
 	unsigned int nwaiters;
 	struct stitcher_waiter
@@ -1076,7 +1077,7 @@ static int stitcher_wake(struct wait_queue_entry *wait, unsigned int mode,
 
 	/* Pairs with smp_store_mb() in stitcher_wait() */
 	smp_wmb();
-	WRITE_ONCE(w->e->triggered, true);
+	WRITE_ONCE(w->e->triggered, 1);
 	return default_wake_function(wait, mode, sync, key);
 }
 
@@ -1153,7 +1154,7 @@ static void stitcher_wait(struct stitcher_engine *e, long timeout)
 		schedule_timeout(timeout);
 	__set_current_state(TASK_RUNNING);
 	/* Pairs with smp_wmb() in stitcher_wake() */
-	smp_store_mb(e->triggered, false);
+	smp_store_mb(e->triggered, 0);
 }
 
 static bool stitcher_src_detached(struct uvc_stitcher *stitcher)
@@ -1198,9 +1199,8 @@ static int stitcher_submit_queued(struct stitcher_engine *e)
 
 	for (;;) {
 		spin_lock_irqsave(&out->q.irqlock, flags);
-		mbuf = list_first_entry_or_null(&out->q.irqqueue,
-						struct stitcher_video_buffer,
-						queue);
+		mbuf = list_first_entry_or_null(
+			&out->q.irqqueue, struct stitcher_video_buffer, queue);
 		if (mbuf)
 			list_del(&mbuf->queue);
 		spin_unlock_irqrestore(&out->q.irqlock, flags);
@@ -1234,13 +1234,21 @@ static int stitcher_collect(struct stitcher_engine *e, int s,
 {
 	struct uvc_stitcher *stitcher = e->stitcher;
 	struct stitcher_dq dq;
+	__poll_t mask;
 	int ret;
 
 	while (e->queued[s]) {
-		/* EPOLLERR: not streaming any more; DQBUF reports why */
-		if (!(vfs_poll(stitcher->src[s].filp, NULL) &
-		      (EPOLLIN | EPOLLERR)))
+		mask = vfs_poll(stitcher->src[s].filp, NULL);
+		if (!(mask & EPOLLIN)) {
+			/*
+			 * EPOLLERR without a buffer: the queue stopped, or the
+			 * node was unregistered and poll() no longer asks vb2.
+			 * DQBUF could block in the latter case.
+			 */
+			if (mask & EPOLLERR)
+				return -ENODEV;
 			return 0;
+		}
 
 		ret = stitcher_dqbuf_src_dmabuf(stitcher, s, &dq);
 		if (ret)
@@ -1290,26 +1298,27 @@ static void stitcher_pop_half(struct stitcher_engine *e, int s,
 		e->nhalf[s] * sizeof(e->half[s][0]));
 }
 
-/* Both halves of output buffer p->index are filled: return it. */
+/* Both halves of output buffer ph->index are filled: return it. */
 static void stitcher_complete(struct stitcher_engine *e,
-			      const struct stitcher_dq *p,
-			      const struct stitcher_dq *s)
+			      const struct stitcher_dq *ph,
+			      const struct stitcher_dq *sh)
 {
 	struct uvc_stitcher *stitcher = e->stitcher;
-	struct vb2_buffer *out_vb = stitcher->out_vb_map[p->index];
+	struct vb2_buffer *out_vb = stitcher->out_vb_map[ph->index];
 	struct vb2_v4l2_buffer *v4l2_vb = to_vb2_v4l2_buffer(out_vb);
 
-	__clear_bit(p->index, &e->inflight);
+	__clear_bit(ph->index, &e->inflight);
 	vb2_set_plane_payload(out_vb, 0, stitcher->frame_size);
-	out_vb->timestamp = ktime_to_ns(ktime_before(p->ts, s->ts) ? p->ts :
-								    s->ts);
-	v4l2_vb->sequence = p->sequence;
+	out_vb->timestamp =
+		ktime_to_ns(ktime_before(ph->ts, sh->ts) ? ph->ts : sh->ts);
+	v4l2_vb->sequence = ph->sequence;
 	v4l2_vb->field = V4L2_FIELD_NONE;
 	vb2_buffer_done(out_vb, VB2_BUF_STATE_DONE);
 
 	if (e->fault_time) {
 		pr_info("uvc_stitcher: recovered %lld ms after the fault (%u restart(s))\n",
-			ktime_ms_delta(ktime_get(), e->fault_time), e->restarts);
+			ktime_ms_delta(ktime_get(), e->fault_time),
+			e->restarts);
 		e->fault_time = 0;
 	}
 	e->restarts = 0;
@@ -1321,39 +1330,43 @@ static void stitcher_complete(struct stitcher_engine *e,
  * start at different times (alt-setting switch latency).
  */
 static int stitcher_warmup(struct stitcher_engine *e,
-			   const struct stitcher_dq *p,
-			   const struct stitcher_dq *s,
+			   const struct stitcher_dq *ph,
+			   const struct stitcher_dq *sh,
 			   enum stitcher_fault *fault)
 {
 	int ret;
 
-	ret = stitcher_queue_half(e, 0, p->index);
+	ret = stitcher_queue_half(e, 0, ph->index);
 	if (!ret)
-		ret = stitcher_queue_half(e, 1, s->index);
+		ret = stitcher_queue_half(e, 1, sh->index);
 	if (ret)
 		return ret;
 
 	if (++e->warm_pairs < STITCHER_SYNC_DRAIN_FRAMES)
 		return 0;
 
-	if (p->sequence != s->sequence &&
+	/* Rate limited: a source that keeps failing restarts every second */
+	if (ph->sequence != sh->sequence &&
 	    e->warm_attempts < STITCHER_SYNC_MAX_RETRIES) {
-		pr_warn("uvc_stitcher: sequence mismatch after draining %d frames: "
+		pr_warn_ratelimited(
+			"uvc_stitcher: sequence mismatch after draining %d frames: "
 			"src0 seq=%u vs src1 seq=%u (attempt %u)\n",
-			STITCHER_SYNC_DRAIN_FRAMES, p->sequence, s->sequence,
+			STITCHER_SYNC_DRAIN_FRAMES, ph->sequence, sh->sequence,
 			e->warm_attempts);
 		e->warm_attempts++;
 		*fault = STITCHER_FAULT_SEQUENCE;
 		return 0;
 	}
 
-	if (p->sequence == s->sequence)
-		pr_info("uvc_stitcher: synced at seq %u (attempt %u, drained %d)\n",
-			p->sequence, e->warm_attempts,
+	if (ph->sequence == sh->sequence)
+		pr_info_ratelimited(
+			"uvc_stitcher: synced at seq %u (attempt %u, drained %d)\n",
+			ph->sequence, e->warm_attempts,
 			STITCHER_SYNC_DRAIN_FRAMES);
 	else
-		pr_warn("uvc_stitcher: sync failed after %d retries (seq %u vs %u), proceeding\n",
-			STITCHER_SYNC_MAX_RETRIES, p->sequence, s->sequence);
+		pr_warn_ratelimited(
+			"uvc_stitcher: sync failed after %d retries (seq %u vs %u), proceeding\n",
+			STITCHER_SYNC_MAX_RETRIES, ph->sequence, sh->sequence);
 
 	e->synced = true;
 	e->warm_attempts = 0;
@@ -1364,52 +1377,54 @@ static int stitcher_warmup(struct stitcher_engine *e,
 static int stitcher_pair(struct stitcher_engine *e, enum stitcher_fault *fault,
 			 bool *busy)
 {
-	struct stitcher_dq p, s;
+	struct stitcher_dq ph, sh;
 	unsigned int offset;
 	int ret;
 
 	while (e->nhalf[0] && e->nhalf[1]) {
-		stitcher_pop_half(e, 0, &p);
-		stitcher_pop_half(e, 1, &s);
+		stitcher_pop_half(e, 0, &ph);
+		stitcher_pop_half(e, 1, &sh);
 		*busy = true;
 
 		/* Halves of different output buffers: give both back */
-		if (p.index != s.index) {
-			pr_warn_ratelimited("uvc_stitcher: DQBUF index mismatch %u vs %u\n",
-					    p.index, s.index);
-			ret = stitcher_queue_half(e, 0, p.index);
+		if (ph.index != sh.index) {
+			pr_warn_ratelimited(
+				"uvc_stitcher: DQBUF index mismatch %u vs %u\n",
+				ph.index, sh.index);
+			ret = stitcher_queue_half(e, 0, ph.index);
 			if (!ret)
-				ret = stitcher_queue_half(e, 1, s.index);
+				ret = stitcher_queue_half(e, 1, sh.index);
 			if (ret)
 				return ret;
 			continue;
 		}
 
 		if (!e->synced) {
-			ret = stitcher_warmup(e, &p, &s, fault);
+			ret = stitcher_warmup(e, &ph, &sh, fault);
 			if (ret || *fault)
 				return ret;
 			continue;
 		}
 
-		if (p.sequence != s.sequence) {
-			offset = (p.sequence > s.sequence) ?
-					 (p.sequence - s.sequence) :
-					 (s.sequence - p.sequence);
+		if (ph.sequence != sh.sequence) {
+			offset = (ph.sequence > sh.sequence) ?
+					 (ph.sequence - sh.sequence) :
+					 (sh.sequence - ph.sequence);
 			if (offset > STITCHER_SEQ_MISMATCH_THRESHOLD) {
-				pr_warn_ratelimited("uvc_stitcher: DQBUF sequence mismatch %u vs %u (offset %u)\n",
-						    p.sequence, s.sequence,
-						    offset);
-				/* p.index stays in flight; the restart requeues it */
+				pr_warn_ratelimited(
+					"uvc_stitcher: DQBUF sequence mismatch %u vs %u (offset %u)\n",
+					ph.sequence, sh.sequence, offset);
+				/* ph.index stays in flight; the restart requeues it */
 				*fault = STITCHER_FAULT_SEQUENCE;
 				return 0;
 			}
 
-			pr_info_ratelimited("uvc_stitcher: seq mismatch %u vs %u, offset %u\n",
-					    p.sequence, s.sequence, offset);
+			pr_info_ratelimited(
+				"uvc_stitcher: seq mismatch %u vs %u, offset %u\n",
+				ph.sequence, sh.sequence, offset);
 		}
 
-		stitcher_complete(e, &p, &s);
+		stitcher_complete(e, &ph, &sh);
 	}
 	return 0;
 }
@@ -1464,8 +1479,9 @@ static int stitcher_restart(struct stitcher_engine *e,
 	long left;
 
 	if (src >= 0)
-		pr_warn_ratelimited("uvc_stitcher: src%d %s, restarting sources\n",
-				    src, stitcher_fault_name[fault]);
+		pr_warn_ratelimited(
+			"uvc_stitcher: src%d %s, restarting sources\n", src,
+			stitcher_fault_name[fault]);
 	else
 		pr_warn_ratelimited("uvc_stitcher: sources %s, restarting\n",
 				    stitcher_fault_name[fault]);
@@ -1758,6 +1774,7 @@ static int stitcher_engine_start(struct uvc_stitcher *stitcher,
 	u32 half_size = frame_size / 2;
 	struct task_struct *task;
 	unsigned int out_count, i;
+	u64 timeout_ms;
 	int ret;
 
 	mutex_lock(&stitcher->uvc_ctrl_lock);
@@ -1798,8 +1815,8 @@ static int stitcher_engine_start(struct uvc_stitcher *stitcher,
 	for (i = 0; i < STITCHER_NUM_SOURCES; i++) {
 		ret = usb_autopm_get_interface(stitcher->src[i].intf);
 		if (ret) {
-			pr_err("uvc_stitcher: autopm_get src%d failed: %d\n",
-			       i, ret);
+			pr_err("uvc_stitcher: autopm_get src%d failed: %d\n", i,
+			       ret);
 			while (i--)
 				usb_autopm_put_interface(stitcher->src[i].intf);
 			goto unlock;
@@ -1826,11 +1843,12 @@ static int stitcher_engine_start(struct uvc_stitcher *stitcher,
 	}
 
 	/* A source silent for this long while the other delivers is restarted */
-	stitcher->src_timeout = msecs_to_jiffies(max_t(
-		u64, STITCHER_SRC_TIMEOUT_MS,
-		div_u64((u64)out->timeperframe.numerator * MSEC_PER_SEC *
-				STITCHER_SRC_TIMEOUT_FRAMES,
-			out->timeperframe.denominator)));
+	timeout_ms = div_u64((u64)out->timeperframe.numerator * MSEC_PER_SEC *
+				     STITCHER_SRC_TIMEOUT_FRAMES,
+			     out->timeperframe.denominator);
+	stitcher->src_timeout = msecs_to_jiffies(
+		clamp_t(u64, timeout_ms, STITCHER_SRC_TIMEOUT_MS,
+			STITCHER_SRC_TIMEOUT_MAX_MS));
 
 	/* Export each output buffer's two halves as dma_bufs */
 	stitcher->frame_size = frame_size;
@@ -2123,8 +2141,8 @@ stitcher_frmsize_nearest_ival(const struct stitcher_frmsize *size,
 	if (!want->numerator || !want->denominator)
 		return best;
 
-	want_us = div_u64((u64)want->numerator * USEC_PER_SEC,
-			  want->denominator);
+	want_us =
+		div_u64((u64)want->numerator * USEC_PER_SEC, want->denominator);
 	for (i = 0; i < size->num_ivals; i++) {
 		us = div_u64((u64)size->ivals[i].numerator * USEC_PER_SEC,
 			     size->ivals[i].denominator);
@@ -2146,8 +2164,8 @@ static void stitcher_fill_pix(const struct stitcher_format *fmt,
 	pix->pixelformat = fmt->info->fourcc;
 	pix->field = V4L2_FIELD_NONE;
 	pix->bytesperline = stitcher_bytesperline(fmt->info, size->width);
-	pix->sizeimage = stitcher_image_size(fmt->info, size->width,
-					     size->height);
+	pix->sizeimage =
+		stitcher_image_size(fmt->info, size->width, size->height);
 	pix->colorspace = V4L2_COLORSPACE_SRGB;
 }
 
@@ -2460,8 +2478,8 @@ static void stitcher_out_add_sizes(struct stitcher_slot *src,
 		fsize.index = i;
 		fsize.pixel_format = fourcc;
 
-		if (UVC_CALL_OP(src, vidioc_enum_framesizes, src->filp,
-				src->fh, &fsize))
+		if (UVC_CALL_OP(src, vidioc_enum_framesizes, src->filp, src->fh,
+				&fsize))
 			break;
 
 		if (fsize.type != V4L2_FRMSIZE_TYPE_DISCRETE) {
@@ -2563,7 +2581,8 @@ static void stitcher_out_free(struct kref *ref)
  */
 static void stitcher_out_vdev_release(struct video_device *vdev)
 {
-	struct stitcher_out *out = container_of(vdev, struct stitcher_out, vdev);
+	struct stitcher_out *out =
+		container_of(vdev, struct stitcher_out, vdev);
 
 	out->vdev_released = true;
 	kref_put(&out->ref, stitcher_out_free);

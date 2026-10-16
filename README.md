@@ -1,6 +1,8 @@
 # UVC Stitch
 
 For a guided setup, open [QuickStart.html](QuickStart.html).
+For the driver's internals, see the
+[architecture diagrams](https://claude.ai/artifact/Pa8GqynunnA9inUouBmGz8).
 
 UVC Stitch is a Linux kernel driver for the EJ535 IC, which has two USB ports
 named P and S. The IC generates a complete frame and splits it into two halves
@@ -253,6 +255,11 @@ the closest entry in the list.
 
 # How It Works — State Machine
 
+The [architecture diagrams](https://claude.ai/artifact/Pa8GqynunnA9inUouBmGz8)
+show the components, how the two halves of a frame reach one output buffer
+(DMABUF), the stream lifecycle, the restart flow, the lock order and the key
+functions in `ejcm3_stitcher.c`.
+
 The driver moves through the following states from load to streaming:
 
 ```
@@ -270,6 +277,7 @@ READY  ──►  format list copied from S, video node registered
   ▼
 STREAMING
   │
+  ├── P or S stops     ──► both ports restarted → STREAMING
   ├── VIDIOC_STREAMOFF ──► engine stopped → READY
   ├── P or S unplug    ──► engine stopped, video node removed → WAITING
   └── rmmod            ──► engine stopped, video node removed → gone
@@ -280,3 +288,21 @@ are present. Streaming starts when an application requests it. Disconnecting
 either port removes the virtual camera; an application that still has it open
 gets an error and has to open the new device after reconnecting. The driver
 does not need to be reloaded.
+
+## Automatic Restart
+
+A port can stop delivering frames on its own: when all of its USB transfers
+fail at stream start (`Non-zero status (-71) in video completion handler` in
+`dmesg`), uvcvideo stops that port. The driver notices this and restarts both
+ports, so the application only sees a short pause instead of a frozen picture.
+A port is restarted when it
+
+- reports that its transfers were cancelled (restarted right away),
+- returns two corrupt frames in a row, or
+- stays silent for 250 ms (or 8 frame periods) while the other port keeps
+  delivering. If both ports are silent, for example without an input signal,
+  nothing is restarted.
+
+The first three restarts in a row happen immediately; after that the driver
+waits 100 ms, doubling up to 1 s, between attempts. `dmesg` shows each
+restart and, once frames flow again, `recovered N ms after the fault`.

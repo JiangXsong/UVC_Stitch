@@ -1,6 +1,8 @@
 # UVC Stitch
 
 For a guided setup, open [QuickStart.html](QuickStart.html).
+For the driver's internals, see the
+[architecture diagrams](https://claude.ai/artifact/Pa8GqynunnA9inUouBmGz8).
 
 UVC Stitch is a Linux kernel driver for the EJ535 IC, which has two USB ports
 named P and S. The IC generates a complete frame and splits it into two halves
@@ -252,6 +254,11 @@ the closest entry in the list.
 ---
 
 # How It Works — State Machine
+
+The [architecture diagrams](https://claude.ai/artifact/Pa8GqynunnA9inUouBmGz8)
+show the components, how the two halves of a frame reach one output buffer
+(DMABUF), the stream lifecycle, the restart flow, the lock order and the key
+functions in `ejcm3_stitcher.c`.
 
 The driver moves through the following states from load to streaming:
 

@@ -1,308 +1,107 @@
 # UVC Stitch
 
-For a guided setup, open [QuickStart.html](QuickStart.html).
-For the driver's internals, see the
-[architecture diagrams](https://claude.ai/artifact/Pa8GqynunnA9inUouBmGz8).
+Linux kernel driver for the EJ535. The EJ535 sends the first half of each frame
+over its P port and the second half over its S port; both appear as UVC
+cameras. The driver joins the halves in the kernel and exposes one camera,
+listed as **UVC Stitcher**, for OBS Studio, ffmpeg and other V4L2 apps.
 
-UVC Stitch is a Linux kernel driver for the EJ535 IC, which has two USB ports
-named P and S. The IC generates a complete frame and splits it into two halves
-(top and bottom); each half is sent through one USB port. The driver reassembles
-the two halves into one frame and exposes one `/dev/videoN` capture device for
-OBS Studio, ffmpeg, and other V4L2-compatible applications. No separate
-user-space stitching process is needed.
+- The camera appears only while both P and S are connected.
+- Its formats come from the S port: same width, twice the height.
+- Internals: [architecture diagrams](https://claude.ai/artifact/Pa8GqynunnA9inUouBmGz8)
 
-The virtual camera appears only while both the P and S ports of the EJ535 are
-connected, and disappears as soon as either one is disconnected. Its format
-list is taken from the S port: same width, twice the height. Streaming starts
-when an application requests video.
+# Requirements
 
-# Hardware Requirements
+| Item     | Requirement                                                        |
+|----------|--------------------------------------------------------------------|
+| Device   | EJ535, VID `1E4E`, PID `7301` (P) and `7302` (S)                   |
+| Host USB | Two separate USB 3.2 Gen 1 (5 Gbps) ports, one per EJ535 port      |
+| Host bus | PCIe Gen 3 ×2 or better (≥ 10 Gbps for 4K60)                       |
+| CPU      | Intel 12th Gen Core i7 / AMD Ryzen 7 5000 or newer recommended     |
+| Kernel   | Tested on 7.0; builds on 6.8, 6.11, 6.14, 6.17, 7.0                |
+| Build    | `sudo apt install build-essential linux-headers-$(uname -r)`       |
 
-| Parameter         | Value                                                         |
-|-------------------|---------------------------------------------------------------|
-| 4K60 Pixel Format | NV12                                                          |
-| Output Layout     | Top-Bottom (one half of each frame per USB port)              |
-| Output Resolution | Up to 3840×2160 (4K) @ 60 fps                                |
-| Host USB Ports    | Two separate USB 3.2 Gen 1 (5 Gbps, also labeled USB 3.0) ports, one for each EJ535 USB port |
-| Host Interface    | PCIe Gen 3 ×2 or above; at least 10 Gbps of bandwidth is required for stable 4K@60fps |
+**Firmware notes**
 
-The driver only recognizes the EJ535 P/S pair with USB VID `1E4E` and PIDs
-`7301` (P) and `7302` (S). Both connections are required. NV12 is the default
-format and is the one to use for stable 4K60.
+- The frame is split by bytes. For NV12 the split falls inside the Y plane, so
+  the S half also carries the UV plane.
+- Describe each pixel format only once per port. uvcvideo uses the first
+  descriptor with a given fourcc and ignores the rest.
 
-For best performance, we recommend a CPU equivalent to Intel 12th Gen Core i7
-or AMD Ryzen 7 5000 series and above. Older CPUs (e.g. Intel 7th Gen Core i5
-or earlier) can run the driver but will see significantly higher CPU utilization.
-
-# Kernel / Software Requirements
-
-## Linux Kernel
-
-The following kernel versions have been validated:
-
-- 5.15.x
-- 6.8.x
-- 6.14.x
-
-## Build Dependencies
-
-The following tools are required to build the kernel module:
-
-- `make`
-- `gcc`
-- Kernel headers matching your running kernel (`linux-headers-$(uname -r)`)
-
-On Ubuntu/Debian, install them with:
+# Build, Install, Load
 
 ```bash
-sudo apt install build-essential linux-headers-$(uname -r)
+make                         # builds uvc_stitch.ko
+sudo make install            # install, enables modprobe
+sudo modprobe uvc_stitch     # load
+sudo modprobe -r uvc_stitch  # unload (close apps using the camera first)
+sudo make autoload           # load at boot (noautoload to undo)
 ```
 
-## Required Kernel Modules
+Rebuild with `make clean && make` after a kernel update or source change.
+Other targets: `uninstall`, `reload`, `clang-format`, `clang-format-check`.
 
-The following kernel modules must be loaded before using UVC Stitch.
-They are included in most standard Linux distributions and are typically
-loaded automatically:
-
-- `uvcvideo` — UVC camera driver
-- `videobuf2` — V4L2 buffer management framework
-
-## Secure Boot
-
-The driver is built locally and is not signed by default. On a computer with
-Secure Boot enabled, loading it fails with:
-
-```
-modprobe: ERROR: could not insert 'uvc_stitch': Key was rejected by service
-```
-
-Check the current state:
+**Secure Boot:** an unsigned module fails with `Key was rejected by service`.
+Either disable Secure Boot, or sign the module with a MOK:
 
 ```bash
-$ mokutil --sb-state
+openssl req -new -x509 -newkey rsa:2048 -nodes -days 36500 \
+    -subj "/CN=UVC Stitch module signing/" -keyout MOK.priv -outform DER -out MOK.der
+sudo mokutil --import MOK.der   # reboot and choose "Enroll MOK"
+make
+/usr/src/linux-headers-$(uname -r)/scripts/sign-file sha256 MOK.priv MOK.der uvc_stitch.ko
+sudo make modules_install
 ```
-
-If Secure Boot is enabled, use one of these options:
-
-- **Disable Secure Boot** in the computer's firmware (BIOS/UEFI) setup. This is
-  the simplest option.
-- **Sign the module** with a Machine Owner Key (MOK). Build the module, sign
-  it, then install it:
-
-  ```bash
-  $ openssl req -new -x509 -newkey rsa:2048 -nodes -days 36500 \
-        -subj "/CN=UVC Stitch module signing/" \
-        -keyout MOK.priv -outform DER -out MOK.der
-  $ sudo mokutil --import MOK.der       # set a one-time password, then reboot
-                                        # and choose "Enroll MOK"
-  $ make
-  $ /usr/src/linux-headers-$(uname -r)/scripts/sign-file sha256 \
-        MOK.priv MOK.der uvc_stitch.ko
-  $ sudo make modules_install
-  ```
-
-  Keep `MOK.priv` private. Sign again after every rebuild.
-
-## Verified Consumer Applications
-
-The following applications have been tested with the UVC Stitch output device:
-
-- [OBS Studio](https://obsproject.com/)
-- [ffmpeg](https://ffmpeg.org/)
-- [ffplay](https://ffmpeg.org/ffplay.html)
-
-# Build
-
-Before building, make sure the build dependencies listed above are installed.
-
-To compile the driver, run:
-
-```bash
-$ make
-```
-
-This produces the kernel module file `uvc_stitch.ko` in the current directory.
-
-## Rebuilding
-
-If you make changes to the source or switch kernel versions, clean the previous
-build before recompiling:
-
-```bash
-$ make clean
-$ make
-```
-
-# Install
-
-Installing the driver makes it available system-wide via `modprobe`, so you
-do not need to specify the full path each time. Root privileges are required.
-
-```bash
-$ make && sudo make install
-```
-
-The module is built for one specific kernel version. After a kernel update,
-rebuild and reinstall it (see [Rebuilding](#rebuilding)); a reboot alone does
-not require a reinstall.
-
-# Load the Driver
-
-Once installed, load the driver with:
-
-```bash
-$ sudo modprobe uvc_stitch
-```
-
-Connect both EJ535 USB ports, P and S, to the host. The virtual camera device
-(`/dev/videoN`) is created once both are connected and removed when either is
-disconnected. After a reconnect the device may get a different number, so
-applications have to select it again.
-
-To unload the driver:
-
-```bash
-$ sudo modprobe -r uvc_stitch
-```
-
-## Load Automatically at Boot
-
-The driver is not loaded automatically after a reboot. Run `sudo modprobe
-uvc_stitch` again after each reboot, or enable auto-load once:
-
-```bash
-$ sudo make autoload
-```
-
-This creates `/etc/modules-load.d/uvc_stitch.conf`. To disable it:
-
-```bash
-$ sudo make noautoload
-```
-
-# Format Source Files
-
-Requires `clang-format` to be installed.
-
-```bash
-$ make clang-format
-```
-
----
 
 # Usage
 
-## Check the Output Device
-
-After loading the driver and connecting the EJ535's P and S USB ports, verify
-the virtual device was created. On Ubuntu/Debian, install `v4l-utils` if
-`v4l2-ctl` is missing:
-
 ```bash
-$ sudo apt install v4l-utils
+v4l2-ctl --list-devices                        # find /dev/videoN (UVC Stitcher)
+v4l2-ctl -d /dev/videoN --list-formats-ext
+ffplay -f v4l2 -input_format nv12 -video_size 3840x2160 -i /dev/videoN
 ```
 
-Then list the devices:
+In OBS Studio, add a "Video Capture Device (V4L2)" source and pick UVC Stitcher.
+The device number may change after replugging.
 
-```bash
-$ v4l2-ctl --list-devices
-```
+# Formats
 
-View detailed information about the output device:
+Listed formats: NV12, YUYV, UYVY, BGR3 (whatever the S port offers). Default:
+NV12 at the largest size, 60 fps. P is set to the same format as S.
 
-```bash
-$ v4l2-ctl -d /dev/videoN --info
-```
+Data per port at 3840×2160, 60 fps, against about 500 MB/s for a 5 Gbps port:
 
-Query the supported video formats:
+| Format     | Per port | 4K60         |
+|------------|----------|--------------|
+| NV12       | 373 MB/s | fits         |
+| YUYV, UYVY | 498 MB/s | no headroom  |
+| BGR3       | 746 MB/s | exceeds link |
 
-```bash
-$ v4l2-ctl -d /dev/videoN --list-formats-ext
-```
+Use NV12 for 4K60. Every format fits at 1920×1080 and below.
 
-Replace `/dev/videoN` with the actual device path shown by `--list-devices`.
-
-## Preview
-
-Preview the live stitched stream (`ffplay` must be installed):
-
-```bash
-$ ffplay -f v4l2 -input_format nv12 -video_size 3840x2160 -i /dev/videoN
-```
-
-Alternatively, add a Video Capture Device (V4L2) source in OBS Studio and select
-the NV12 video format for 4K60.
-
-# Formats and Defaults
-
-The format list is built from the S port when the virtual camera is created.
-Every S-port format the driver can stitch (NV12, YUYV, UYVY, BGR3) is listed
-with the same width and twice the height; frame rates are the S port's. For
-example, an S-port `NV12 3840x1080 @ 60 fps` becomes `NV12 3840x2160 @ 60 fps`.
-The P port is set to the same format when streaming starts.
-
-| Setting    | Default                                         |
-|------------|-------------------------------------------------|
-| Format     | NV12                                            |
-| Resolution | Largest NV12 size (e.g. 3840×2160)              |
-| Frame rate | First frame interval of that size (e.g. 60 fps) |
-
-These can be changed before starting the stream via `VIDIOC_S_FMT`
-(resolution/format) and `VIDIOC_S_PARM` (framerate). Requests are snapped to
-the closest entry in the list.
-
----
-
-# How It Works — State Machine
-
-The [architecture diagrams](https://claude.ai/artifact/Pa8GqynunnA9inUouBmGz8)
-show the components, how the two halves of a frame reach one output buffer
-(DMABUF), the stream lifecycle, the restart flow, the lock order and the key
-functions in `ejcm3_stitcher.c`.
-
-The driver moves through the following states from load to streaming:
+# How It Works
 
 ```
-WAITING  ──modprobe──►  no video node
-  │
-  │  EJ535 P and S ports enumerate as UVC devices (fixed VID/PID match)
-  │  src_ready_count: 0 → 1 → 2
-  │
-  ▼
-READY  ──►  format list copied from S, video node registered
-  │
-  │  VIDIOC_STREAMON
-  │    UVC S_FMT / REQBUFS(DMABUF) / QBUF / STREAMON
-  │    kthread_run()
-  ▼
-STREAMING
-  │
-  ├── P or S stops     ──► both ports restarted → STREAMING
-  ├── VIDIOC_STREAMOFF ──► engine stopped → READY
-  ├── P or S unplug    ──► engine stopped, video node removed → WAITING
-  └── rmmod            ──► engine stopped, video node removed → gone
+WAITING ──(P and S connected)──► READY: node registered, formats copied from S
+READY ──(STREAMON)──► STREAMING: kthread pairs the halves via DMABUF
+STREAMING ──(P or S stops)──► both ports restarted ──► STREAMING
+STREAMING ──(STREAMOFF)──► READY
+any ──(P or S unplugged)──► WAITING: node removed
 ```
-
-**In short:** the virtual camera exists only while both EJ535 USB connections
-are present. Streaming starts when an application requests it. Disconnecting
-either port removes the virtual camera; an application that still has it open
-gets an error and has to open the new device after reconnecting. The driver
-does not need to be reloaded.
 
 ## Automatic Restart
 
-A port can stop delivering frames on its own: when all of its USB transfers
-fail at stream start (`Non-zero status (-71) in video completion handler` in
-`dmesg`), uvcvideo stops that port. The driver notices this and restarts both
-ports, so the application only sees a short pause instead of a frozen picture.
-A port is restarted when it
+The EJ535 sometimes fails all USB transfers on one port right after streaming
+starts (`Non-zero status (-71)` in `dmesg`); this also happens without this
+driver. uvcvideo then stops that port for good, so the driver restarts both
+ports when one of them:
 
-- reports that its transfers were cancelled (restarted right away),
+- returns cancelled buffers (restart at once),
 - returns two corrupt frames in a row, or
-- stays silent for 250 ms (or 8 frame periods) while the other port keeps
-  delivering. If both ports are silent, for example without an input signal,
-  nothing is restarted.
+- stays silent for 250 ms while the other keeps delivering.
 
-The first three restarts in a row happen immediately; after that the driver
-waits 100 ms, doubling up to 1 s, between attempts. `dmesg` shows each
-restart and, once frames flow again, `recovered N ms after the fault`.
+The first three restarts are immediate, then 100 ms doubling to 1 s.
+`dmesg` shows `recovered N ms after the fault`; measured 48–379 ms
+(median 97 ms) on Linux 7.0.
+
+**OBS tip:** turn off "Autoreset on Timeout", or set "Frames Until Timeout" to
+30 or more. The default (5 frames ≈ 83 ms) interrupts the driver's recovery.
